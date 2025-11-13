@@ -1,6 +1,8 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import io
+from typing import Optional
 from pathlib import Path
 import plotly.express as px
 
@@ -18,42 +20,48 @@ st.title("NAEI Point Source — Treemap Explorer")
 DATA_FILE = Path(__file__).with_name("NAEIPointsSource_2023.xlsx")
 
 
-def load_dataframe(uploaded_file) -> pd.DataFrame | None:
-    """Load dataframe from uploaded file or default workbook next to this script.
-
-    Returns None if no file found or it can't be read.
-    """
-    # prefer uploaded file
-    xls = None
-    if uploaded_file is not None:
-        try:
-            xls = pd.ExcelFile(uploaded_file, engine="openpyxl")
-        except Exception as e:
-            st.sidebar.error(f"Failed to read uploaded file: {e}")
-            return None
-
-    # otherwise try default workbook next to script
-    if xls is None and DATA_FILE.exists():
-        try:
-            xls = pd.ExcelFile(DATA_FILE, engine="openpyxl")
-        except Exception as e:
-            st.sidebar.error(f"Failed to read local data file {DATA_FILE.name}: {e}")
-            return None
-
-    if xls is None:
-        return None
-
-    # choose a sheet similar to the notebook: prefer sheet index 3 if available
+@st.cache_data(show_spinner=False)
+def _read_excel_from_bytes(data_bytes: Optional[bytes], local_path: Optional[str]) -> Optional[pd.DataFrame]:
+    """Read Excel from bytes (uploaded) or from local path. Cached to avoid re-reading on each interaction."""
     try:
+        if data_bytes is not None:
+            xls = pd.ExcelFile(io.BytesIO(data_bytes), engine="openpyxl")
+        elif local_path is not None:
+            xls = pd.ExcelFile(local_path, engine="openpyxl")
+        else:
+            return None
         sheets = xls.sheet_names
         sheet_idx = 3 if len(sheets) > 3 else 0
         df = pd.read_excel(xls, sheet_name=sheets[sheet_idx], engine="openpyxl")
         return df
-    except Exception as e:
-        st.sidebar.error(f"Failed to load sheet from workbook: {e}")
+    except Exception:
         return None
 
 
+def load_dataframe(uploaded_file) -> pd.DataFrame | None:
+    """Wrap uploaded_file handling then delegate to cached reader."""
+    if uploaded_file is not None:
+        try:
+            data = uploaded_file.read()
+        except Exception:
+            st.sidebar.error("Failed to read uploaded file bytes.")
+            return None
+        df = _read_excel_from_bytes(data, None)
+        if df is None:
+            st.sidebar.error("Failed to parse uploaded Excel workbook.")
+        return df
+
+    # no upload — try local file
+    if DATA_FILE.exists():
+        df = _read_excel_from_bytes(None, str(DATA_FILE))
+        if df is None:
+            st.sidebar.error(f"Failed to parse local data file {DATA_FILE.name}.")
+        return df
+
+    return None
+
+
+@st.cache_data(show_spinner=False)
 def ensure_emissions_gwp(df: pd.DataFrame) -> pd.DataFrame:
     """Return a copy of df with numeric Emissions_GWP column.
 
@@ -113,6 +121,7 @@ def ensure_emissions_gwp(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(show_spinner=False)
 def normalize_pollutant_names_and_gwp(df: pd.DataFrame) -> pd.DataFrame:
     """Apply pollutant name normalization and add a GWP column mapping as in the notebook."""
     df = df.copy()
@@ -155,6 +164,7 @@ def convert_easting_northing(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(show_spinner=False)
 def aggregate_like_notebook(df: pd.DataFrame) -> pd.DataFrame:
     """Aggregate to site-level similar to the notebook's df_aggregated creation."""
     ignore = ["PollutantID", "Pollutant_Name", "Emissions_GWP", "GWP", "Emission"]
@@ -165,6 +175,7 @@ def aggregate_like_notebook(df: pd.DataFrame) -> pd.DataFrame:
             agg_dict[col] = (lambda s, col=col: ",".join(sorted(set(s.dropna().astype(str)))))
 
     try:
+        # group once, cacheable
         df_aggregated = df.groupby(group_cols, dropna=False, as_index=False).agg(agg_dict)
         df_aggregated.drop(columns=["PollutantID", "Pollutant_Name", "GWP"], inplace=True, errors='ignore')
         return df_aggregated
@@ -315,8 +326,10 @@ def main():
 
     # Try to mirror the notebook preprocessing: normalize pollutant names and map GWP where possible
     df = normalize_pollutant_names_and_gwp(df)
-    # Convert Easting/Northing to lat/lon if available (optional, uses geopandas)
-    df = convert_easting_northing(df)
+    # Convert Easting/Northing to lat/lon only when explicitly requested (geopandas can be slow)
+    geo_convert = st.sidebar.checkbox("Enable Easting/Northing → lat/lon conversion (may be slow)", value=False, help="Only enable if you need the point map and have geopandas installed")
+    if geo_convert:
+        df = convert_easting_northing(df)
 
     # If raw Emission x GWP columns are present, prefer computing Emissions_GWP directly
     if "Emission" in df.columns and "GWP" in df.columns:
@@ -357,6 +370,8 @@ def main():
 
     # Aggregate to site-level using the notebook-like aggregation; then detect columns from aggregated table
     df_aggregated = aggregate_like_notebook(df)
+    # store aggregated in session_state so repeated interactions don't force recompute in some cases
+    st.session_state["df_aggregated"] = df_aggregated
     df, year_col, region_col, sector_col, site_col = detect_columns(df_aggregated)
 
     # controls
